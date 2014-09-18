@@ -18,7 +18,7 @@ cdef class PolymorphicFn(object):
 
 
     def __call__(self, *args):
-        return self._dict[type(args[0])](*args)
+        return self._dict.get(type(args[0]), self._default)(*args)
 
     cpdef set_default(self, f):
         self._default = f

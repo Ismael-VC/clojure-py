@@ -98,6 +98,7 @@ _clone = poly.PolymorphicFn(IClonable, "-clone")
 
 ICounted = poly.Protocol("ICounted")
 _count = poly.PolymorphicFn(ICounted, "-count")
+count = _count
 
 IEmptyableCollection = poly.Protocol("IEmptyableCollection")
 _empty = poly.PolymorphicFn(IEmptyableCollection, "-empty")
@@ -115,7 +116,10 @@ ASeq = poly.Protocol("ASeq")
 
 ISeq = poly.Protocol("ISeq")
 _first = poly.PolymorphicFn(ISeq, "-first")
+_first.extend(type(None), lambda x: x)
+
 _rest = poly.PolymorphicFn(ISeq, "-rest")
+_rest.extend(type(None), lambda x: x)
 
 first = _first
 rest = _rest
@@ -126,6 +130,8 @@ _rest.set_default(lambda x: _rest(_seq(x)))
 
 INext = poly.Protocol("INext")
 _next = poly.PolymorphicFn(INext, "-next")
+_next.extend(type(None), lambda x: x)
+
 
 next = _next
 
@@ -175,6 +181,8 @@ _kv_reduce = poly.PolymorphicFn(IReduce, "-kv-reduce")
 
 IEquiv = poly.Protocol("IEquiv")
 _equiv = poly.PolymorphicFn(IEquiv, "-equiv")
+_equiv.set_default(lambda x, y: x == y)
+equiv = _equiv
 
 IFn = poly.Protocol("IFn")
 _invoke = poly.PolymorphicFn(IFn, "-invoke")
@@ -315,6 +323,32 @@ cdef uint add_to_string_hash_cache(unicode k):
         return add_to_string_hash_cache(k)
     return h
 
+cdef uint mix_collection_hash(uint hash_basis, uint count):
+    cdef uint h1
+    cdef uint k1
+
+    h1 = m3_seed
+    k1 = m3_mix_K1(hash_basis)
+    h1 = m3_mix_H1(h1, k1)
+    return m3_fmix(h1, count)
+
+
+cpdef uint hash_ordered_coll(coll):
+    cdef uint n
+    cdef uint hash_code
+
+    n = <uint>0
+    hash_code = <uint>1
+    coll = seq(coll)
+    while coll is not None:
+
+        hash_code = (<uint>31 * hash_code) + <uint>hash(first(coll))
+        n += <uint>1
+        coll = next(coll)
+
+    return  mix_collection_hash(hash_code, n)
+
+
 
 ### Hashing
 import math
@@ -326,6 +360,36 @@ _hash.extend(type(None), lambda x: 0)
 _hash.extend(int, lambda x: m3_hash_int(<uint>x))
 
 hash = _hash
+
+### helpers
+
+cpdef bint is_sequential(x):
+    return ISequential.satisfied_by(type(x))
+
+cpdef bint is_counted(x):
+    return ICounted.satisfied_by(type(x))
+
+
+cpdef bint equiv_sequential(x, y):
+    if is_counted(x) and is_counted(y) and not count(x) == count(y):
+        return False
+
+    if is_sequential(y):
+        xs = seq(x)
+        ys = seq(y)
+
+        while True:
+            if xs is None:
+                return ys is None
+            if ys is None:
+                return False
+            if equiv(first(xs), first(ys)):
+                xs = next(xs)
+                ys = next(ys)
+                continue
+            return False
+    else:
+        return False
 
 ### Symbol
 
@@ -423,6 +487,17 @@ cdef class IndexedSeq(object):
         self._arr = arr
         self._i = i
 
+    def __richcmp__(self, other, int c):
+        if c == 2:
+            return equiv(self, other)
+        elif c == 3:
+            return not equiv(self, other)
+        else:
+            raise ValueError("Can't compare Items")
+
+    def __hash__(self):
+        return hash(self)
+
 @extend(_clone, IndexedSeq)
 def _clone(IndexedSeq self):
     return IndexedSeq(self._arr, self._i)
@@ -461,6 +536,13 @@ def _nth(IndexedSeq self, n, not_found):
         return self._arr[i]
     return not_found
 
+ISequential.mark_satisfied(IndexedSeq)
+
+_equiv.extend(IndexedSeq, equiv_sequential)
+
+
+_hash.extend(IndexedSeq, hash_ordered_coll)
+_hash.extend(__builtins__.tuple, hash_ordered_coll)
 
 @extend(_seq, __builtins__.list)
 def _seq(coll):
