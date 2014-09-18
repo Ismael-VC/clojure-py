@@ -10,7 +10,7 @@ cdef class PolymorphicFn(object):
         self._default = self.__default_fn
 
     def __default_fn(self, *args):
-        raise NotImplemented("method " + self._name + " not implemented for " + str(type(args[0])))
+        raise Exception("method " + self._name + " not implemented for " + str(type(args[0])))
 
     cpdef extend(self, tp, f):
         self._dict[tp] = f

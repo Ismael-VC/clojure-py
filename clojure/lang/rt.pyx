@@ -4,6 +4,11 @@ import array as _array
 import cython as cython
 
 
+cdef class Unset(object):
+    pass
+
+unset = Unset()
+
 
 class ArityException(Exception):
     def __init__(self, arity):
@@ -105,6 +110,7 @@ _empty = poly.PolymorphicFn(IEmptyableCollection, "-empty")
 
 ICollection = poly.Protocol("ICollection")
 _conj = poly.PolymorphicFn(ICollection, "-conj")
+conj = _conj
 
 IIndexed = poly.Protocol("IIndexed")
 _nth = poly.PolymorphicFn(IIndexed, "-nth")
@@ -161,6 +167,7 @@ _assoc_n = poly.PolymorphicFn(IVector, "-assoc-n")
 
 IDeref = poly.Protocol("IDeref")
 _deref = poly.PolymorphicFn(IDeref, "-deref")
+deref = _deref
 
 IDerefWithTimeout = poly.Protocol("IDerefWithTimeout")
 _deref_with_timeout = poly.PolymorphicFn(IDerefWithTimeout, "-deref-with-timeout")
@@ -175,6 +182,11 @@ _with_meta = poly.PolymorphicFn(IMeta, "-with-meta")
 
 IReduce = poly.Protocol("IReduce")
 _reduce = poly.PolymorphicFn(IReduce, "-reduce")
+
+def reduce(f, val, coll = unset):
+    if coll is unset:
+        return _reduce(val, coll)
+    return _reduce(coll, f, val)
 
 IKVReduce = poly.Protocol("IKVReduce")
 _kv_reduce = poly.PolymorphicFn(IReduce, "-kv-reduce")
@@ -391,6 +403,51 @@ cpdef bint equiv_sequential(x, y):
     else:
         return False
 
+### Reducing Helpers
+
+cdef class Reduced(object):
+    cdef _val
+
+    def __init__(self, val):
+        self._val = val
+
+@extend(_deref, Reduced)
+def _deref(Reduced r):
+    return r._val
+
+def reduced(x):
+    """Wraps x in a way such that a reduce will terminate with the value x"""
+    return Reduced(x)
+
+def is_reduced(x):
+    return isinstance(x, Reduced)
+
+
+
+
+
+cpdef array_reduce(arr, f, val = unset, uint i = 0):
+    cdef uint cnt
+    cnt = <uint>len(arr)
+
+    if cnt == 0:
+        return f()
+
+    if val is unset:
+        val = arr[0]
+        n = <uint>1
+    if i != 0:
+        n = i
+
+    while n < cnt:
+        val = f(val, arr[n])
+        if is_reduced(val):
+            return deref(val)
+        n += 1
+
+    return val
+
+
 ### Symbol
 
 
@@ -542,6 +599,17 @@ _equiv.extend(IndexedSeq, equiv_sequential)
 
 
 _hash.extend(IndexedSeq, hash_ordered_coll)
+
+
+@extend(_reduce, IndexedSeq)
+def _reduce(IndexedSeq self, f, start=unset):
+    if start is not unset:
+        return array_reduce(self._arr, f, self._arr[self._i], self._i + 1)
+    else:
+        return array_reduce(self._arr, f, start, self._i)
+
+## Interop with other python types
+
 _hash.extend(__builtins__.tuple, hash_ordered_coll)
 
 @extend(_seq, __builtins__.list)
@@ -553,3 +621,149 @@ def _seq(coll):
 def _seq(coll):
     return IndexedSeq(coll, 0)
 
+
+
+### PersistentVector
+
+cdef class VectorNode(object):
+    cdef _edit
+    cdef list _arr
+
+    def __init__(self, _edit, _arr):
+        self._edit = _edit
+        self._arr = _arr
+
+cdef pv_fresh_node(edit):
+    return VectorNode(edit, make_array(32))
+
+cdef pv_aget(VectorNode node, uint idx):
+    return node._arr[idx]
+
+cdef VectorNode pv_aset(VectorNode node, uint idx, val):
+    node._arr[idx] = val
+    return node
+
+cdef VectorNode pv_clone_node(VectorNode node):
+    return VectorNode(node._edit, aclone(node._arr))
+
+cdef class PersistentVector(object):
+    cdef meta
+    cdef uint cnt
+    cdef uint shift
+    cdef root
+    cdef tail
+    cdef __hash
+
+    def __init__(self, meta, cnt, shift, root, tail, __hash):
+        self.meta = meta
+        self.cnt = cnt
+        self.shift = shift
+        self.root = root
+        self.tail = tail
+        self.__hash = __hash
+
+
+
+
+cdef uint tail_off(PersistentVector pv):
+    cdef uint cnt
+    cnt = pv.cnt
+    if cnt < <uint>32:
+        return 0
+    return ((cnt - <uint>1) >> <uint>5) << <uint>5
+
+
+cdef new_path(edit, uint level, VectorNode node):
+    cdef uint ll
+    ll = level
+    ret = node
+
+    while ll != 0:
+        embed = ret
+        r = pv_fresh_node(edit)
+        ret = pv_aset(r, 0, embed)
+        ll -= <uint>5
+
+    return ret
+
+cdef push_tail(PersistentVector pv, uint level, VectorNode parent, tailnode):
+    cdef uint subidx
+    ret = pv_clone_node(parent)
+    subidx = ((pv.cnt - 1) >> level) & 0x01f
+
+    if level == 5:
+        pv_aset(ret, subidx, tailnode)
+        return ret
+
+    child = pv_aset(parent, subidx, tailnode)
+    if child is not None:
+        node_to_insert = push_tail(pv, level - 5, child, tailnode)
+        pv_aset(ret, subidx, node_to_insert)
+        return ret
+
+    node_to_insert = new_path(None, level - 5, tailnode)
+    pv_aset(ret, subidx, node_to_insert)
+    return ret
+
+cdef vector_index_out_of_bounds(i, cnt):
+    raise Exception("No item " + str(i) + " in vector of length " + str(cnt))
+
+cdef first_array_for_longvec(PersistentVector pv):
+    node = pv.root
+    level = pv.shift
+    while level > 0:
+        node = pv_aget(node, 0)
+        level -= 5
+
+    return node._arr
+
+cdef unchecked_array_for(PersistentVector pv, uint i):
+    cdef uint level
+
+    if i >= tail_off(pv):
+        return pv.tail
+
+
+    node = pv.root
+    level = pv.shift
+    while level > 0:
+        node = pv_aget(node, (i >> level) & 0x01f)
+        level -= 5
+
+    return node.arr
+
+cdef array_for(PersistentVector pv, uint i):
+    if 0 <= i < pv.cnt:
+        return unchecked_array_for(pv, i)
+    vector_index_out_of_bounds(i, pv.cnt)
+
+
+cdef VectorNode EMPTY_VECTOR_NODE
+EMPTY_VECTOR_NODE = VectorNode(None, make_array(32))
+
+cdef PersistentVector EMPTY_VECTOR
+EMPTY_VECTOR = PersistentVector(None, 0, 5, EMPTY_VECTOR_NODE, array(), 0)
+
+
+@extend(_conj, PersistentVector)
+def _conj(PersistentVector self, o):
+    cdef uint alen
+
+    if self.cnt - tail_off(self) < 32:
+        alen = len(self.tail)
+        new_tail = self.tail[:]
+        new_tail.append(o)
+        return PersistentVector(self.meta, self.cnt + 1, self.shift, self.root, new_tail, None)
+
+    raise NotImplemented
+
+
+@extend(_nth, PersistentVector)
+def _nth(PersistentVector self, n, not_found):
+    if 0 <= n <= self.cnt:
+        return unchecked_array_for(self, n)[n & 0x01f]
+    return not_found
+
+
+def vector():
+    return EMPTY_VECTOR
