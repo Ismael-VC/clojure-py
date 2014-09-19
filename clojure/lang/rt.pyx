@@ -629,9 +629,13 @@ cdef class VectorNode(object):
     cdef _edit
     cdef list _arr
 
-    def __init__(self, _edit, _arr):
+    def __init__(self, _edit, list _arr):
+        assert isinstance(_arr, list)
         self._edit = _edit
         self._arr = _arr
+
+    def arr(self):
+        return self._arr
 
 cdef pv_fresh_node(edit):
     return VectorNode(edit, make_array(32))
@@ -640,6 +644,7 @@ cdef pv_aget(VectorNode node, uint idx):
     return node._arr[idx]
 
 cdef VectorNode pv_aset(VectorNode node, uint idx, val):
+    assert not isinstance(val, type)
     node._arr[idx] = val
     return node
 
@@ -654,7 +659,7 @@ cdef class PersistentVector(object):
     cdef tail
     cdef __hash
 
-    def __init__(self, meta, cnt, shift, root, tail, __hash):
+    def __init__(self, meta, uint cnt, uint shift, VectorNode root, list tail, uint __hash = 0):
         self.meta = meta
         self.cnt = cnt
         self.shift = shift
@@ -662,7 +667,11 @@ cdef class PersistentVector(object):
         self.tail = tail
         self.__hash = __hash
 
+    def get_node(self):
+        return self.root
 
+    def get_tail(self):
+        return self.tail
 
 
 cdef uint tail_off(PersistentVector pv):
@@ -686,8 +695,9 @@ cdef new_path(edit, uint level, VectorNode node):
 
     return ret
 
-cdef push_tail(PersistentVector pv, uint level, VectorNode parent, tailnode):
+cdef VectorNode push_tail(PersistentVector pv, uint level, VectorNode parent, VectorNode tailnode):
     cdef uint subidx
+    cdef VectorNode ret
     ret = pv_clone_node(parent)
     subidx = ((pv.cnt - 1) >> level) & 0x01f
 
@@ -708,7 +718,7 @@ cdef push_tail(PersistentVector pv, uint level, VectorNode parent, tailnode):
 cdef vector_index_out_of_bounds(i, cnt):
     raise Exception("No item " + str(i) + " in vector of length " + str(cnt))
 
-cdef first_array_for_longvec(PersistentVector pv):
+cdef list first_array_for_longvec(PersistentVector pv):
     node = pv.root
     level = pv.shift
     while level > 0:
@@ -717,8 +727,9 @@ cdef first_array_for_longvec(PersistentVector pv):
 
     return node._arr
 
-cdef unchecked_array_for(PersistentVector pv, uint i):
+cdef list unchecked_array_for(PersistentVector pv, uint i):
     cdef uint level
+    cdef VectorNode node
 
     if i >= tail_off(pv):
         return pv.tail
@@ -729,10 +740,9 @@ cdef unchecked_array_for(PersistentVector pv, uint i):
     while level > 0:
         node = pv_aget(node, (i >> level) & 0x01f)
         level -= 5
+    return node._arr
 
-    return node.arr
-
-cdef array_for(PersistentVector pv, uint i):
+cdef list array_for(PersistentVector pv, uint i):
     if 0 <= i < pv.cnt:
         return unchecked_array_for(pv, i)
     vector_index_out_of_bounds(i, pv.cnt)
@@ -742,26 +752,41 @@ cdef VectorNode EMPTY_VECTOR_NODE
 EMPTY_VECTOR_NODE = VectorNode(None, make_array(32))
 
 cdef PersistentVector EMPTY_VECTOR
-EMPTY_VECTOR = PersistentVector(None, 0, 5, EMPTY_VECTOR_NODE, array(), 0)
-
+EMPTY_VECTOR = PersistentVector(None, 0, 5, EMPTY_VECTOR_NODE, array())
 
 @extend(_conj, PersistentVector)
 def _conj(PersistentVector self, o):
     cdef uint alen
+    cdef bint root_overflow
+    cdef uint new_shift
+    cdef VectorNode new_root
 
     if self.cnt - tail_off(self) < 32:
         alen = len(self.tail)
         new_tail = self.tail[:]
         new_tail.append(o)
-        return PersistentVector(self.meta, self.cnt + 1, self.shift, self.root, new_tail, None)
+        return PersistentVector(self.meta, self.cnt + 1, self.shift, self.root, new_tail)
 
-    raise NotImplemented
+    root_overflow = (self.cnt >> 5) > (1 << self.shift)
+    new_shift = self.shift + 5 if root_overflow else self.shift
+
+    if root_overflow:
+        new_root = pv_fresh_node(None)
+        pv_aset(new_root, 0, self.root)
+        pv_aset(new_root, 1, new_path(None, self.shift, VectorNode(None, self.tail)))
+
+    else:
+        new_root = push_tail(self, self.shift, self.root, VectorNode(None, self.tail))
+
+    return PersistentVector(self.meta, self.cnt + 1, new_shift, new_root, array(o))
+
 
 
 @extend(_nth, PersistentVector)
 def _nth(PersistentVector self, n, not_found):
     if 0 <= n <= self.cnt:
-        return unchecked_array_for(self, n)[n & 0x01f]
+        v = unchecked_array_for(self, n)
+        return v[n & 0x01f]
     return not_found
 
 
